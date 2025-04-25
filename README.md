@@ -1,4 +1,5 @@
 #  VulnScope
+![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)
 
 **VulnScope** est un outil d'analyse de vulnérabilités web développé avec Python & Streamlit.  
 Il détecte les failles courantes comme :
