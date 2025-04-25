@@ -1,0 +1,5 @@
+streamlit
+nmap
+requests
+python-whois
+reportlab
