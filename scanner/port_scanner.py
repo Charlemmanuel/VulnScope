@@ -1,23 +1,15 @@
-import nmap
+# scanner/port_scanner.py
 import socket
 
-def scan_ports(host):
+def scan_ports(domain, ports=[80, 443, 21, 22, 25, 110, 143, 3306, 8080]):
+    results = {"tcp": {}}
     try:
-        # Résolution du nom de domaine en adresse IP
-        ip = socket.gethostbyname(host)
-
-        scanner = nmap.PortScanner()
-        scanner.scan(ip, arguments='-T4 -F')
-
-        if ip not in scanner.all_hosts():
-            return {"error": "Scan échoué — l'hôte ne répond pas ou est bloqué."}
-
-        result = {}
-        for proto in scanner[ip].all_protocols():
-            ports = scanner[ip][proto].keys()
-            result[proto] = {
-                port: scanner[ip][proto][port]['state'] for port in ports
-            }
-        return result
+        ip = socket.gethostbyname(domain)
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                result = sock.connect_ex((ip, port))
+                results["tcp"][port] = "open" if result == 0 else "filtered"
+        return results
     except Exception as e:
         return {"error": str(e)}
