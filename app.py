@@ -7,11 +7,14 @@ from utils.generate_report import generate_pdf_report
 import socket
 from datetime import datetime
 import requests
+import pandas as pd
+import dns.resolver
+import dns.exception
 
 # Page config
 st.set_page_config(page_title="VulnScope", layout="wide", page_icon="🔐")
 
-# Custom style
+# Style personnalisé
 st.markdown("""
     <style>
     .stApp { background-color: #0e0e0e; }
@@ -31,6 +34,9 @@ st.markdown("""
         font-weight: bold;
         margin-top: 5px;
     }
+    div[data-testid="stDataFrame"] div {
+        font-size: 25px !important;
+    }
     .high { background-color: #ff4d4d; color: white; }
     .medium { background-color: #ffa500; color: white; }
     .low { background-color: #28a745; color: white; }
@@ -47,8 +53,9 @@ with col2:
 st.markdown("<hr style='border: 1px solid #8e44ad;'>", unsafe_allow_html=True)
 
 # Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["🧪 Analyse", "📄 Rapport PDF", "ℹ️ À propos", "🔎 Tests semi-actifs"])
+tab1, tab2, tab3 = st.tabs(["🧪 Analyse", "📄 Rapport PDF", "ℹ️ À propos"])
 
+# ============ ANALYSE PRINCIPALE ============
 with tab1:
     st.subheader("🔍 Scanner un site web")
 
@@ -58,8 +65,38 @@ with tab1:
         if url:
             domain = url.replace("https://", "").replace("http://", "").split('/')[0]
             st.success(f"Analyse lancée pour : {url}")
-            ip = socket.gethostbyname(domain)
-            st.info(f"📡 Adresse IP résolue : {ip}")
+
+            ip = None
+            ipv6_addresses = []
+
+            try:
+                ip = socket.gethostbyname(domain)
+                st.info(f"📡 Adresse IPv4 : {ip}")
+            except socket.gaierror:
+                st.error("❌ Erreur DNS : nom de domaine introuvable")
+            except Exception as e:
+                st.warning(f"Erreur lors de la résolution IPv4 : {e}")
+
+            try:
+                infos = socket.getaddrinfo(domain, None, socket.AF_INET6)
+                ipv6_addresses = list(set([x[4][0] for x in infos]))
+                if ipv6_addresses:
+                    st.info("🌐 Adresse(s) IPv6 : " + ", ".join(ipv6_addresses))
+            except Exception as e:
+                st.warning("IPv6 non disponible ou non résolu.")
+
+            # DNS Failover check
+            try:
+                dns_resolver = dns.resolver.Resolver()
+                dns_resolver.timeout = 2
+                dns_resolver.lifetime = 2
+                answers = dns_resolver.resolve(domain)
+                resolved_ips = [a.address for a in answers]
+                st.success(f"✅ DNS fonctionne : {', '.join(resolved_ips)}")
+            except dns.exception.Timeout:
+                st.warning("⚠️ DNS timeout (failover ou serveur lent)")
+            except Exception as e:
+                st.error(f"Erreur DNS : {e}")
 
             # Analyse
             port_results = scan_ports(domain)
@@ -67,19 +104,70 @@ with tab1:
             whois_result = get_whois_info(domain)
             ssl_result = check_ssl_certificate(domain)
 
-            # Score sécurité simple
-            if "error" not in headers_result:
-                attendus = ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options", "X-XSS-Protection"]
-                manquants = [h for h in attendus if h not in headers_result]
-                score = max(0, 100 - len(manquants) * 20)
-                st.markdown(f"""
-                    <div class='score-box'>
-                        <h2 style='color: #8e44ad;'>🔐 Score de sécurité</h2>
-                        <p style='font-size: 24px; color: white;'>{score}/100</p>
-                    </div>
-                """, unsafe_allow_html=True)
+            # Score simple basé sur headers HTTP
+            score = 100
+            details = []
 
-            # Grille de 2 x 2 pour les résultats
+            # 1. Headers HTTP (max -40)
+            attendus = ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options", "X-XSS-Protection"]
+            if "error" not in headers_result:
+                manquants = [h for h in attendus if h not in headers_result]
+                score -= len(manquants) * 10
+                if manquants:
+                    details.append(f"- Headers manquants : {', '.join(manquants)} (-{len(manquants) * 10} pts)")
+            else:
+                score -= 40
+                details.append("- Erreur lors de l'analyse des headers (-40 pts)")
+
+            # 2. Ports sensibles (max -20)
+            sensitive_ports = {21, 22, 23, 25, 110, 143, 3306, 3389, 8080}
+            sensitive_open = False
+            if "error" not in port_results:
+                for proto, ports in port_results.items():
+                    for port, state in ports.items():
+                        if int(port) in sensitive_ports and state == "open":
+                            sensitive_open = True
+                            break
+            if sensitive_open:
+                score -= 20
+                details.append("- Ports sensibles ouverts (-20 pts)")
+
+            # 3. Certificat SSL (max -20)
+            if "error" not in ssl_result:
+                if ssl_result.get("SSL Valide") is not True:
+                    score -= 20
+                    details.append("- Certificat SSL invalide ou expiré (-20 pts)")
+            else:
+                score -= 20
+                details.append("- Erreur lors de l'analyse SSL (-20 pts)")
+
+            # 4. WHOIS (max -10)
+            if "error" not in whois_result:
+                if whois_result.get("Emails") and any("privacy" in str(e).lower() for e in whois_result["Emails"]):
+                    score -= 10
+                    details.append("- Informations WHOIS masquées (-10 pts)")
+            else:
+                score -= 10
+                details.append("- Erreur WHOIS (-10 pts)")
+
+            # 5. DNS check (max -10)
+            if 'DNS fonctionne' not in locals():
+                score -= 10
+                details.append("- Problème de résolution DNS (-10 pts)")
+
+            # Score final propre
+            score = max(0, min(score, 100))
+
+            st.markdown(f"""
+                <div class='score-box'>
+                    <h2 style='color: #8e44ad;'>🔐 Score de sécurité</h2>
+                    <p style='font-size: 24px; color: white;'>{score}/100</p>
+                </div>
+            """, unsafe_allow_html=True)
+
+            if details:
+                st.markdown("<br>".join([f"✅ {d}" for d in details]), unsafe_allow_html=True)
+
             col1, col2 = st.columns(2)
 
             with col1:
@@ -87,15 +175,15 @@ with tab1:
                 if "error" in port_results:
                     st.error(port_results['error'])
                 else:
-                    sensitive_ports = {21, 22, 23, 25, 110, 143, 3306, 3389, 8080}
+                    flat = []
                     severity = "low"
+                    sensitive_ports = {21, 22, 23, 25, 110, 143, 3306, 3389, 8080}
                     for proto, ports in port_results.items():
-                        st.markdown(f"**Protocole : {proto}**")
                         for port, state in ports.items():
-                            color = "green" if state == "open" else "red"
-                            st.markdown(f"<span style='color:{color}; font-weight: bold;'>Port {port} : {state}</span>", unsafe_allow_html=True)
+                            flat.append({"Protocole": proto, "Port": port, "État": state})
                             if int(port) in sensitive_ports and state == "open":
                                 severity = "high"
+                    st.dataframe(pd.DataFrame(flat))
                     badge = "<span class='badge high'>Gravité : Haute - Ports sensibles ouverts</span>" if severity == "high" else "<span class='badge low'>Gravité : Faible - Aucun port critique détecté</span>"
                     st.markdown(badge, unsafe_allow_html=True)
 
@@ -103,9 +191,9 @@ with tab1:
                 if "error" in headers_result:
                     st.error(headers_result['error'])
                 else:
-                    for k, v in headers_result.items():
-                        st.markdown(f"- **{k}** : {v}")
-                    missing = [h for h in ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options", "X-XSS-Protection"] if h not in headers_result]
+                    header_df = pd.DataFrame([{"Header": k, "Valeur": str(v)} for k, v in headers_result.items()])
+                    st.dataframe(header_df, use_container_width=True)
+                    missing = [h for h in attendus if h not in headers_result]
                     if missing:
                         st.markdown(f"<span class='badge medium'>Gravité : Moyenne - Headers manquants</span>", unsafe_allow_html=True)
                     else:
@@ -116,8 +204,8 @@ with tab1:
                 if "error" in whois_result:
                     st.error(whois_result['error'])
                 else:
-                    for k, v in whois_result.items():
-                        st.markdown(f"**{k}** : {v}")
+                    whois_df = pd.DataFrame([{"Champ": k, "Valeur": str(v)} for k, v in whois_result.items()])
+                    st.dataframe(whois_df, use_container_width=True)
                     if whois_result.get("emails") and any("privacy" in str(e).lower() for e in whois_result["emails"]):
                         st.markdown(f"<span class='badge medium'>Gravité : Moyenne - Propriété anonymisée</span>", unsafe_allow_html=True)
                     else:
@@ -127,13 +215,14 @@ with tab1:
                 if "error" in ssl_result:
                     st.error(ssl_result['error'])
                 else:
-                    for k, v in ssl_result.items():
-                        st.markdown(f"**{k}** : {v}")
+                    ssl_df = pd.DataFrame([{"Champ": k, "Valeur": str(v)} for k, v in ssl_result.items()])
+                    st.dataframe(ssl_df, use_container_width=True)
                     if ssl_result.get("SSL Valide") is not True:
                         st.markdown(f"<span class='badge high'>Gravité : Haute - SSL invalide ou expiré</span>", unsafe_allow_html=True)
                     else:
                         st.markdown(f"<span class='badge low'>Gravité : Faible - SSL valide</span>", unsafe_allow_html=True)
 
+            # Stockage session
             st.session_state["scan"] = {
                 "url": url,
                 "ip": ip,
@@ -142,9 +231,8 @@ with tab1:
                 "whois_result": whois_result,
                 "ssl_result": ssl_result
             }
-        else:
-            st.warning("Veuillez entrer une URL valide.")
 
+# ============ RAPPORT PDF ============
 with tab2:
     st.subheader("📄 Générer le rapport PDF")
 
@@ -166,6 +254,7 @@ with tab2:
     else:
         st.info("Lance d'abord une analyse pour générer le rapport.")
 
+# ============ À PROPOS ============
 with tab3:
     st.subheader("ℹ️ À propos de VulnScope")
     st.markdown("""
@@ -175,36 +264,8 @@ with tab3:
     - Infos WHOIS
     - Certificat SSL
     - Rapport PDF automatique 📄
+    - Résolution IPv6 et détection d'erreurs DNS
+    - Affichage clair via tableaux dynamiques
 
     **Développé avec Streamlit & Python.**
     """)
-
-with tab4:
-    st.subheader("🔎 Tests semi-actifs (XSS & SQLi GET)")
-    test_url = st.text_input("Entrez une URL vulnérable (avec paramètre GET ex: ?id=1)")
-
-    if st.button("🧪 Tester XSS"):
-        if test_url:
-            payload = "<script>alert('xss')</script>"
-            full_url = f"{test_url}{'&' if '?' in test_url else '?'}xss={payload}"
-            try:
-                response = requests.get(full_url, timeout=5)
-                if payload in response.text:
-                    st.error("🚨 Vulnérabilité XSS détectée (reflet du script)")
-                else:
-                    st.success("✅ Aucun reflet détecté. Pas de XSS visible.")
-            except Exception as e:
-                st.warning(f"Erreur : {e}")
-
-    if st.button("💣 Tester SQLi"):
-        if test_url:
-            payload = "1' OR '1'='1"
-            sqli_url = test_url + ("&" if "?" in test_url else "?") + f"id={payload}"
-            try:
-                response = requests.get(sqli_url, timeout=5)
-                if any(err in response.text.lower() for err in ["sql syntax", "mysql", "warning", "ora-"]):
-                    st.error("🚨 Potentielle injection SQL détectée !")
-                else:
-                    st.success("✅ Pas de comportement SQLi détecté.")
-            except Exception as e:
-                st.warning(f"Erreur : {e}")
