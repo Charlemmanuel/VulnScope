@@ -2,5 +2,3 @@ streamlit
 requests
 whois
 reportlab
-dnspython
-pandas
